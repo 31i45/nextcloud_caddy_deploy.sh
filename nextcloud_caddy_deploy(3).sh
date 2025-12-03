@@ -427,58 +427,26 @@ configure_nextcloud() {
   $occ_cmd config:app:set richdocuments disable_certificate_verification --value="true" >/dev/null 2>&1
   $occ_cmd config:app:set richdocuments wopi_allowlist --value="172.19.0.0/16" >/dev/null 2>&1
 
+  $occ_cmd config:system:set memcache.local --value="\\OC\\Memcache\\Redis" >/dev/null 2>&1
+  $occ_cmd config:system:set memcache.locking --value="\\OC\\Memcache\\Redis" >/dev/null 2>&1
+  $occ_cmd config:system:set redis host --value="redis" >/dev/null 2>&1
+  $occ_cmd config:system:set redis port --value="6379" >/dev/null 2>&1
+  $occ_cmd config:system:set redis password --value="$REDIS_PASSWORD" >/dev/null 2>&1
+
+  $occ_cmd config:system:set datadirectory --value="/var/www/html/data" >/dev/null 2>&1
+
+  $occ_cmd config:system:set loglevel --value="2" >/dev/null 2>&1 || echo "日志级别配置失败"
+
+  $occ_cmd config:system:set trusted_domains 0 --value="$SERVER_IP:$HTTPS_PORT" >/dev/null 2>&1 || echo "信任域名配置失败"
+  $occ_cmd config:system:set trusted_domains 1 --value="127.0.0.1:$HTTPS_PORT" >/dev/null 2>&1 || echo "信任域名配置失败"
+  $occ_cmd config:system:set trusted_domains 2 --value="localhost:$HTTPS_PORT" >/dev/null 2>&1 || echo "信任域名配置失败"
+
   $occ_cmd config:system:set allow_local_remote_servers --type boolean --value true >/dev/null 2>&1
   $occ_cmd config:system:set maintenance_window_start --type integer --value 2 >/dev/null 2>&1
   $occ_cmd config:system:set maintenance_window_end --type integer --value 4 >/dev/null 2>&1
 
   info "执行系统维护..."
   $occ_cmd maintenance:repair --include-expensive >/dev/null 2>&1 || warning "部分维护操作执行失败"
-}
-
-# 数据备份功能（适配数据卷）
-backup_data() {
-  [ ! -f "$ENV_FILE" ] && error "环境配置文件不存在"
-  source "$ENV_FILE"
-
-  mkdir -p "$BACKUP_DIR" || error "备份目录创建失败: $BACKUP_DIR"
-  [ ! -w "$BACKUP_DIR" ] && error "备份目录不可写: $BACKUP_DIR"
-
-  local timestamp="$(date +%Y%m%d_%H%M%S)"
-  local backup_file="$BACKUP_DIR/nextcloud_backup_$timestamp.tar.gz"
-  local temp_dir="$PROJECT_ROOT/temp_backup"
-  mkdir -p "$temp_dir"
-
-  info "开始备份数据到 $backup_file"
-
-  # 备份数据库
-  if ! $DOCKER_COMPOSE_CMD -p nextcloud -f "$CONFIG_DIR/docker-compose.yml" --env-file "$ENV_FILE" exec -T -e MYSQL_PWD="${MYSQL_ROOT_PASSWORD}" \
-     mariadb mysqldump -u root nextcloud > "$temp_dir/nextcloud_db.sql"; then
-    rm -rf "$temp_dir"
-    error "数据库备份失败"
-  fi
-
-  # 备份Nextcloud数据（从数据卷复制）
-  if ! $DOCKER_COMPOSE_CMD -p nextcloud -f "$CONFIG_DIR/docker-compose.yml" --env-file "$ENV_FILE" cp nextcloud:/var/www/html "$temp_dir/nextcloud_data"; then
-    rm -rf "$temp_dir"
-    error "Nextcloud数据备份失败"
-  fi
-
-  # 备份配置文件
-  cp -r "$CONFIG_DIR" "$temp_dir/"
-  cp "$ENV_FILE" "$temp_dir/"
-
-  # 打包备份
-  if ! tar -czf "$backup_file" -C "$temp_dir" .; then
-    rm -rf "$temp_dir"
-    error "数据打包失败"
-  fi
-
-  # 清理临时文件
-  rm -rf "$temp_dir" || warning "临时备份目录清理失败"
-
-  # 删除7天前的旧备份
-  find "$BACKUP_DIR" -name "nextcloud_backup_*.tar.gz" -mtime +7 -delete || warning "旧备份清理失败"
-  info "备份完成: $backup_file"
 }
 
 # 服务控制函数
@@ -510,4 +478,4 @@ main() {
   start
 }
 
-main
+main "$@"
