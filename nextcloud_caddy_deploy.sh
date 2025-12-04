@@ -1,140 +1,158 @@
 #!/bin/bash
-# 优化版Nextcloud一键部署脚本（含Collabora协作编辑）- 使用Caddy作为反向代理
-# 注意：此脚本仅适用于Linux系统
-
+# 极简版Nextcloud部署脚本 - 极致极简、极致克制、极致可靠
+# groups | grep docker
+# sudo usermod -aG docker $USER
 set -euo pipefail
-# set -x
 
-# 核心配置（优先使用环境变量指定路径）
-# 优先级：命令行参数 > 环境变量 > 默认路径
-PROJECT_ROOT="${1:-${NC_PROJECT_ROOT:-$HOME/nextcloud}}"
-# 转换为绝对路径（避免相对路径问题）
-PROJECT_ROOT=$(realpath "$PROJECT_ROOT")
-CONFIG_DIR="$PROJECT_ROOT/configs"
+# ---------------------- 配置部分 ----------------------
+PROJECT_DIR="$HOME/nextcloud"
+CONFIG_DIR="$PROJECT_DIR/configs"
 ENV_FILE="$CONFIG_DIR/.env"
+mkdir -p "$CONFIG_DIR"
 
-# 目录定义
-BACKUP_DIR="$HOME/nextcloud_backups/"
+# ---------------------- 环境变量处理 ----------------------
 
-# 网络配置
-HTTPS_PORT=${HTTPS_PORT:-18443}
-SERVER_IP=$(hostname -I | cut -d' ' -f1)
-[ -z "$SERVER_IP" ] && SERVER_IP="127.0.0.1"
+# 生成随机密码
+generate_password() {
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16
+}
 
-# 颜色输出配置
-GREEN="\033[0;32m"
-RED="\033[0;31m"
-YELLOW="\033[1;33m"
-NC="\033[0m"
-info() { echo -e "${GREEN}? $1${NC}"; }
-error() { echo -e "${RED}? $1${NC}"; exit 1; }
-warning() { echo -e "${YELLOW}? $1${NC}"; }
-
-# 容器镜像配置
-NEXTCLOUD_IMAGE="nextcloud:production-fpm-alpine"
-MARIADB_IMAGE="mariadb:11.4"
-COLLABORA_IMAGE="collabora/code:latest"
-CADDY_IMAGE="caddy:2.10.0-alpine"
-REDIS_IMAGE="redis:alpine"
-
-# Docker Compose命令兼容处理
-if docker compose version &>/dev/null; then
-  DOCKER_COMPOSE_CMD="docker compose"
-elif docker-compose version &>/dev/null; then
-  DOCKER_COMPOSE_CMD="docker-compose"
-else
-  error "未找到docker compose或docker-compose，请先安装"
+if [ ! -f "$ENV_FILE" ]; then
+  cat > "$ENV_FILE" <<EOF
+SERVER_IP="$(hostname -I | cut -d' ' -f1 || echo "127.0.0.1")"
+HTTPS_PORT="18443"
+ADMIN_USER="admin"
+ADMIN_PASSWORD="$(generate_password)"
+MYSQL_PASSWORD="$(generate_password)"
+MYSQL_ROOT_PASSWORD="$(generate_password)"
+REDIS_PASSWORD="$(generate_password)"
+COLLABORA_PASSWORD="$(generate_password)"
+EOF
+  # 添加权限设置，仅允许文件所有者读写
+  chmod 600 "$ENV_FILE"
+fi
+# 直接使用shell方式加载环境变量
+if [ -f "$ENV_FILE" ]; then
+  source "$ENV_FILE"
 fi
 
-# 检查端口占用
-check_ports() {
-  local port="$HTTPS_PORT"
-  if (command -v ss >/dev/null && ss -tuln | grep -q ":$port\b") ||
-     (command -v netstat >/dev/null && netstat -tuln | grep -q ":$port\b"); then
-    error "端口 $port 已被占用，请释放后重试"
+# ---------------------- 函数定义 ----------------------
+
+# Docker Compose命令
+dc() {
+  if command -v docker-compose >/dev/null 2>&1; then
+    docker-compose "$@"
+  else
+    docker compose "$@"
   fi
 }
 
-# 依赖检查
-check_deps() {
-  info "检查系统依赖..."
-  local deps=("docker" "openssl" "tar" "find")
-  for dep in "${deps[@]}"; do
-    if ! command -v "$dep" &>/dev/null; then
-      error "缺少必要依赖: $dep"
-    fi
-  done
+# 执行Nextcloud occ命令
+occ() {
+  dc -p nextcloud -f "$CONFIG_DIR/docker-compose.yml" exec -T nextcloud php occ "$@"
 }
 
-# 目录初始化（简化版，只需创建配置目录）
-init_dirs() {
-  info "初始化目录结构..."
-  mkdir -p "$CONFIG_DIR"
-  chmod 755 "$PROJECT_ROOT" "$CONFIG_DIR"
+# 配置Nextcloud
+config_nextcloud() {
+  
+  # ---------------------- 核心性能配置 ----------------------
+  # 配置Redis缓存和文件锁定，提升性能
+  occ config:system:set memcache.local --value="\\OC\\Memcache\\Redis" >/dev/null 2>&1 || echo "Redis本地缓存配置失败"
+  occ config:system:set memcache.locking --value="\\OC\\Memcache\\Redis" >/dev/null 2>&1 || echo "Redis锁缓存配置失败"
+  occ config:system:set redis host --value="redis" >/dev/null 2>&1 || echo "Redis主机配置失败"
+  occ config:system:set redis port --value="6379" >/dev/null 2>&1 || echo "Redis端口配置失败"
+  occ config:system:set redis password --value="$REDIS_PASSWORD" >/dev/null 2>&1 || echo "Redis密码配置失败"
+  
+  # 必须配置：优化文件系统检查
+  occ config:system:set filesystem_check_changes --type boolean --value false >/dev/null 2>&1 || echo "文件系统检查配置失败"
+  
+  # 必须配置：启用完整UTF-8支持
+  occ config:system:set mysql.utf8mb4 --type boolean --value true >/dev/null 2>&1 || echo "MySQL UTF8MB4配置失败"
+  
+  # 推荐配置：优化文件缓存
+  occ config:system:set filecache.ttl --type integer --value 3600 >/dev/null 2>&1 || echo "文件缓存TTL配置失败"
+  
+  # 必须配置：优化预览生成
+  occ config:system:set preview_max_x --type integer --value 2048 >/dev/null 2>&1 || echo "预览最大宽度配置失败"
+  occ config:system:set preview_max_y --type integer --value 2048 >/dev/null 2>&1 || echo "预览最大高度配置失败"
+  occ config:system:set preview_max_filesize_image --type integer --value 50 >/dev/null 2>&1 || echo "图片预览文件大小限制配置失败"
+  
+  # ---------------------- 核心安全配置 ----------------------
+  # 禁用不受支持的应用
+  occ config:system:set disable_unsupported_apps --type boolean --value true >/dev/null 2>&1 || echo "禁用不受支持的应用配置失败"
+  
+  # ---------------------- 核心功能配置 ----------------------
+  # 启用外部存储支持
+  occ app:enable files_external >/dev/null 2>&1 || echo "外部存储应用启用失败"
+
+  # 设置默认电话号码区域
+  occ config:system:set default_phone_region --value='CN' >/dev/null 2>&1 || echo "默认电话号码区域配置失败"
+  
+  # 安装并配置Collabora集成 - 完整配置
+  occ app:install richdocuments >/dev/null 2>&1 || echo "Richdocuments插件安装失败"
+  occ app:enable richdocuments >/dev/null 2>&1 || echo "Richdocuments插件启用失败"
+  
+  occ config:app:set richdocuments wopi_url --value="http://collabora:9980" >/dev/null 2>&1 || echo "Collabora WOPI URL配置失败"
+  occ config:app:set richdocuments disable_certificate_verification --value="true" >/dev/null 2>&1 || echo "Collabora证书验证配置失败"
+  occ config:app:set richdocuments wopi_allowlist --value="172.19.0.0/16" >/dev/null 2>&1 || echo "Collabora WOPI白名单配置失败"
+  
+  # 配置支持所有Office文档格式 - 最完整的格式列表
+  occ config:app:set richdocuments formats --value='["odt","ods","odp","docx","xlsx","pptx","doc","xls","ppt","txt","rtf","csv","tsv","html","htm","epub","pdf","odg","odf","odb","ots","ott","otp","oth","xlsm","xltx","xlsm","xlsb","pptm","potx","potm","ppsx","ppsm","dotx","dotm","rtfd","wps","wks","wpd","sxc","stc","sxd","std","sxi","sti","sxm","sdw","sgl","vor","uop","uof","zabw","zot"]' >/dev/null 2>&1 || echo "Office文档格式配置失败"
+  
+  # 启用编辑功能
+  occ config:app:set richdocuments edit --value="true" >/dev/null 2>&1 || echo "编辑功能启用失败"
+  
+  # 配置文档预览
+  occ config:app:set richdocuments preview_office_files --value="true" >/dev/null 2>&1 || echo "Office文档预览配置失败"
+  
+  # 配置默认编辑器
+  occ config:app:set richdocuments default_editor --value="collabora" >/dev/null 2>&1 || echo "默认编辑器配置失败"
+  
+  # ---------------------- 系统可靠性配置 ----------------------
+  # 配置维护窗口
+  occ config:system:set maintenance_window_start --type integer --value 2 >/dev/null 2>&1 || echo "维护窗口开始时间配置失败"
+  occ config:system:set maintenance_window_end --type integer --value 4 >/dev/null 2>&1 || echo "维护窗口结束时间配置失败"
+  
+  # 执行mimetype迁移
+  occ maintenance:repair --include-expensive >/dev/null 2>&1 || echo "维护修复（包含昂贵操作）失败"
+  
+  # 配置日志级别
+  occ config:system:set loglevel --value="2" >/dev/null 2>&1 || echo "日志级别配置失败"
+  
+  # ---------------------- 信任域名配置 ----------------------
+  # 配置信任域名，支持多种访问方式
+  occ config:system:set trusted_domains 0 --value="$SERVER_IP:$HTTPS_PORT" >/dev/null 2>&1 || echo "信任域名（服务器IP）配置失败"
+  occ config:system:set trusted_domains 1 --value="127.0.0.1:$HTTPS_PORT" >/dev/null 2>&1 || echo "信任域名（本地回环）配置失败"
+  occ config:system:set trusted_domains 2 --value="localhost:$HTTPS_PORT" >/dev/null 2>&1 || echo "信任域名（本地主机）配置失败"
+  occ config:system:set trusted_proxies 0 --value='172.19.0.0/16' >/dev/null 2>&1 || echo "信任代理配置失败"
+
+  # ---------------------- 禁用不必要的应用 ----------------------
+  # 禁用首次运行向导
+  occ app:disable firstrunwizard >/dev/null 2>&1 || echo "首次运行向导禁用失败"
+  
+  # 禁用默认应用
+  occ app:disable calendar >/dev/null 2>&1 || echo "日历应用禁用失败"
+  occ app:disable contacts >/dev/null 2>&1 || echo "联系人应用禁用失败"
+  occ app:disable activity >/dev/null 2>&1 || echo "活动应用禁用失败"
+  occ app:disable gallery >/dev/null 2>&1 || echo "画廊应用禁用失败"
 }
 
-# 生成环境变量
-gen_env() {
-  [ -f "$ENV_FILE" ] && { info "加载现有环境配置"; source "$ENV_FILE"; return; }
+# ---------------------- 配置文件生成 ----------------------
 
-  info "生成安全配置信息..."
-  ADMIN_USER="${ADMIN_USER:-admin}"
-  ADMIN_PASS="${ADMIN_PASS:-$(openssl rand -hex 12)}"
-  MYSQL_PASSWORD=$(openssl rand -hex 12)
-  MYSQL_ROOT_PASSWORD=$(openssl rand -hex 16)
-  REDIS_PASSWORD=$(openssl rand -hex 16)
-  COLLABORA_PASSWORD=$(openssl rand -hex 12)
-
-  cat > "$ENV_FILE" <<EOF
-# 管理员账户
-ADMIN_USER=$ADMIN_USER
-ADMIN_PASS=$ADMIN_PASS
-
-# 数据库密码
-MYSQL_PASSWORD=$MYSQL_PASSWORD
-MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
-
-# 缓存服务密码
-REDIS_PASSWORD=$REDIS_PASSWORD
-
-# 在线编辑服务密码
-COLLABORA_PASSWORD=$COLLABORA_PASSWORD
-
-# 网络配置
-SERVER_IP=$SERVER_IP
-HTTPS_PORT=$HTTPS_PORT
-EOF
-  chmod 600 "$ENV_FILE"
-
-  cat <<EOF
-重要提示:
-  - 请妥善保管管理员密码，首次登录后建议立即修改
-  - 由于使用自签名证书，访问时请点击"高级"->"继续访问"
-EOF
-  info "管理员账号: $ADMIN_USER"
-  info "管理员密码: $ADMIN_PASS"
-  info "访问地址: https://$SERVER_IP:$HTTPS_PORT"
-}
-
-# 生成核心配置文件
-gen_configs() {
-  info "生成服务配置文件..."
-  [ ! -f "$ENV_FILE" ] && error "环境配置文件不存在，请先运行初始化"
-  source "$ENV_FILE"
-
-  cat > "$CONFIG_DIR/docker-compose.yml" <<EOF
-networks:
-  nextcloud_network:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.19.0.0/16
-
+# 生成docker-compose.yml
+cat > "$CONFIG_DIR/docker-compose.yml" <<EOF
 volumes:
+  # nextcloud_data: # 可改为指向其他磁盘或目录，示例配置：
+  #   name: nextcloud_data
+  #   driver: local
+  #   driver_opts:
+  #     type: none
+  #     o: bind
+  #     device: /path/to/your/disk
   nextcloud_data:
     name: nextcloud_data
-  db_data:
-    name: nextcloud_db_data
+  mariadb_data:
+    name: nextcloud_mariadb_data
   redis_data:
     name: nextcloud_redis_data
   caddy_data:
@@ -142,95 +160,133 @@ volumes:
   caddy_config:
     name: nextcloud_caddy_config
 
-x-logging: &default-logging
-  driver: "json-file"
-  options:
-    max-size: "10m"
-    max-file: "5"
+networks:
+  default:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.19.0.0/16
 
 services:
   mariadb:
-    image: $MARIADB_IMAGE
+    image: mariadb:11.4
     restart: always
-    volumes:
-      - db_data:/var/lib/mysql
+    volumes: [mariadb_data:/var/lib/mysql]
     environment:
-      - MYSQL_ROOT_PASSWORD=$MYSQL_ROOT_PASSWORD
-      - MYSQL_DATABASE=nextcloud
-      - MYSQL_USER=nextcloud
-      - MYSQL_PASSWORD=$MYSQL_PASSWORD
-    networks: [nextcloud_network]
-    command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW
+      MYSQL_ROOT_PASSWORD: $MYSQL_ROOT_PASSWORD
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: $MYSQL_PASSWORD
+    command: --transaction-isolation=READ-COMMITTED --binlog-format=ROW --innodb_buffer_pool_size=256M --innodb_log_file_size=64M
+    networks: [default]
     healthcheck:
       test: ["CMD", "mariadb-admin", "ping", "-h", "localhost", "-u", "root", "-p$MYSQL_ROOT_PASSWORD"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 60s
-    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   redis:
-    image: $REDIS_IMAGE
+    image: redis:alpine
     restart: always
-    command: redis-server --requirepass $REDIS_PASSWORD --save 60 1
-    networks: [nextcloud_network]
-    volumes:
-      - redis_data:/data
+    volumes: [redis_data:/data]
+    command: redis-server --requirepass $REDIS_PASSWORD --maxmemory 256mb --maxmemory-policy allkeys-lru
+    networks: [default]
     healthcheck:
       test: ["CMD", "redis-cli", "-u", "redis://default:$REDIS_PASSWORD@localhost:6379", "PING"]
       interval: 5s
       timeout: 3s
       retries: 3
       start_period: 10s
-    logging: *default-logging
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
 
   nextcloud:
-    image: $NEXTCLOUD_IMAGE
+    image: nextcloud:production-fpm-alpine
     restart: always
     volumes:
       - nextcloud_data:/var/www/html
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 128M
     environment:
-      - MYSQL_DATABASE=nextcloud
-      - MYSQL_USER=nextcloud
-      - MYSQL_PASSWORD=$MYSQL_PASSWORD
-      - MYSQL_HOST=mariadb
-      - NEXTCLOUD_ADMIN_USER=$ADMIN_USER
-      - NEXTCLOUD_ADMIN_PASSWORD=$ADMIN_PASS
-      - REDIS_HOST=redis
-      - REDIS_HOST_PASSWORD=$REDIS_PASSWORD
-      - NEXTCLOUD_TRUSTED_DOMAINS=$SERVER_IP:$HTTPS_PORT
-      - NEXTCLOUD_TRUSTED_PROXIES=172.19.0.0/16
-      - OVERWRITEHOST=$SERVER_IP:$HTTPS_PORT
-      - OVERWRITEPROTOCOL=https
-      - OVERWRITECLIURL=https://$SERVER_IP:$HTTPS_PORT
-      - PHP_MEMORY_LIMIT=1024M
-      - PHP_UPLOAD_LIMIT=10G
-      - PHP_MAX_EXECUTION_TIME=3600
-      - PHP_MAX_INPUT_VARS=10000
-      - TZ=Asia/Shanghai
-    networks: [nextcloud_network]
+      MYSQL_DATABASE: nextcloud
+      MYSQL_USER: nextcloud
+      MYSQL_PASSWORD: $MYSQL_PASSWORD
+      MYSQL_HOST: mariadb
+      NEXTCLOUD_ADMIN_USER: $ADMIN_USER
+      NEXTCLOUD_ADMIN_PASSWORD: $ADMIN_PASSWORD
+      REDIS_HOST: redis
+      REDIS_HOST_PASSWORD: $REDIS_PASSWORD
+      NEXTCLOUD_TRUSTED_DOMAINS: $SERVER_IP:$HTTPS_PORT
+      NEXTCLOUD_TRUSTED_PROXIES: 172.19.0.0/16
+      OVERWRITEHOST: $SERVER_IP:$HTTPS_PORT
+      OVERWRITEPROTOCOL: https
+      OVERWRITECLIURL: https://$SERVER_IP:$HTTPS_PORT
+      PHP_MEMORY_LIMIT: 1024M
+      PHP_UPLOAD_LIMIT: 10G
+      PHP_MAX_EXECUTION_TIME: 3600
+      PHP_MAX_INPUT_VARS: 10000
+      TZ: Asia/Shanghai
+    networks: [default]
     healthcheck:
       test: ["CMD-SHELL", "php /var/www/html/occ status | grep -q 'installed: true' || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 180s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
     depends_on:
       mariadb: {condition: service_healthy}
       redis: {condition: service_healthy}
-    logging: *default-logging
 
   caddy:
-    image: $CADDY_IMAGE
+    image: caddy:2.10.0-alpine
     restart: always
-    ports:
-      - "$HTTPS_PORT:443"
+    ports: [80:80, $HTTPS_PORT:443]
     volumes:
       - "$CONFIG_DIR/Caddyfile:/etc/caddy/Caddyfile:ro"
       - nextcloud_data:/var/www/html:ro
       - caddy_data:/data
       - caddy_config:/config
-    networks: [nextcloud_network]
+    networks: [default]
     environment:
       - SERVER_IP=$SERVER_IP
       - HTTPS_PORT=$HTTPS_PORT
@@ -242,33 +298,59 @@ services:
       timeout: 10s
       retries: 3
       start_period: 60s
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       nextcloud: {condition: service_healthy}
-    logging: *default-logging
 
   collabora:
-    image: $COLLABORA_IMAGE
+    image: collabora/code:latest # 25.04.7.3.1
     restart: always
     cap_add: [CAP_SYS_ADMIN, CAP_MKNOD]
     security_opt: [seccomp:unconfined]
     environment:
-      - domain=$SERVER_IP
-      - username=admin
-      - password=$COLLABORA_PASSWORD
-      - extra_params=--o:ssl.enable=false --o:ssl.termination=true --o:net.hostsallow=all --o:allow-origin=https://$SERVER_IP:$HTTPS_PORT --o:server_name=$SERVER_IP:$HTTPS_PORT
-    networks: [nextcloud_network]
+      domain: $SERVER_IP:$HTTPS_PORT # 包含端口号，确保正确识别Nextcloud实例
+      username: admin
+      password: $COLLABORA_PASSWORD
+      dictionaries: en_US en_GB fr_FR de_DE es_ES pt_BR ru_RU zh_CN # 支持多语言拼写检查
+      extra_params: --o:ssl.enable=false --o:ssl.termination=true --o:net.hostsallow=all --o:allow-origin=https://$SERVER_IP:$HTTPS_PORT --o:server_name=$SERVER_IP:$HTTPS_PORT --o:storage.wopi.host.enable=true --o:collabora.enable=true --o:user_interface.default_language=zh-CN --o:user_interface.show_warning_banner=false
+    networks: [default]
     healthcheck:
       test: ["CMD", "curl", "--fail", "--silent", "--output", "/dev/null", "http://localhost:9980/hosting/capabilities"]
       interval: 30s
       timeout: 10s
       retries: 3
       start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '1.0'
+          memory: 1G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       nextcloud: {condition: service_healthy}
-    logging: *default-logging
 EOF
 
-  cat > "$CONFIG_DIR/Caddyfile" <<EOF
+# 生成Caddyfile
+cat > "$CONFIG_DIR/Caddyfile" <<EOF
 {
     # 全局配置
     default_sni $SERVER_IP
@@ -295,10 +377,11 @@ $SERVER_IP:443 {
         X-Content-Type-Options "nosniff"
         X-Frame-Options "SAMEORIGIN"
         -Server
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self' ws: wss:; frame-src 'self' collabora:; object-src 'none';"
     }
 
     # 压缩
-    encode gzip
+    encode gzip zstd
 
     # WebDAV重定向
     redir /.well-known/carddav /remote.php/dav/ 301
@@ -310,7 +393,7 @@ $SERVER_IP:443 {
     @forbidden path /.htaccess /data/* /config/* /3rdparty/* /lib/* /templates/* /occ /console.php /updater/* /.user.ini
     respond @forbidden 403
 
-    # OCS API处理（保持简单）
+    # OCS API处理
     handle /ocs/v*.php* {
         php_fastcgi nextcloud:9000 {
             dial_timeout 5s
@@ -337,7 +420,6 @@ $SERVER_IP:443 {
     @collabora path /browser/* /hosting/* /cool/* /lool/* /adminws/* /loleaflet/* /wopi/*
     handle @collabora {
         reverse_proxy collabora:9980 {
-            header_up Host {upstream_hostport}
             header_up X-Forwarded-Proto https
             header_up X-Forwarded-For {remote_host}
 
@@ -351,7 +433,23 @@ $SERVER_IP:443 {
         }
     }
 
-    # WebSocket支持
+    # Collabora WebSocket支持 - 优先级高于通用WebSocket
+    @collabora_ws {
+        path /cool/* /lool/* /adminws/*
+        header Connection *Upgrade*
+        header Upgrade websocket
+    }
+    handle @collabora_ws {
+        reverse_proxy collabora:9980 {
+            transport http {
+                keepalive 3600s
+                read_timeout 3600s
+                write_timeout 3600s
+            }
+        }
+    }
+
+    # 通用WebSocket支持
     @websocket {
         header Connection *Upgrade*
         header Upgrade websocket
@@ -387,127 +485,51 @@ $SERVER_IP:443 {
     # 日志
     log {
         level INFO
+        format json
+        output file /var/log/caddy/access.log {
+          roll_size 10mb
+          roll_keep 5
+          roll_keep_for 720h
+        }
     }
 }
 
-# HTTP重定向
-http://$SERVER_IP {
-    redir https://{host}{uri} 301
+# HTTP重定向 - 使用80端口
+:80 {
+  redir https://{host}:$HTTPS_PORT{uri} 301
 }
 EOF
-}
 
-# 等待Nextcloud就绪
-wait_for_nextcloud() {
-  info "等待Nextcloud服务就绪..."
-  local max_attempts=60
-  local attempt=1
-  while [ $attempt -le $max_attempts ]; do
-    if $DOCKER_COMPOSE_CMD -p nextcloud -f "$CONFIG_DIR/docker-compose.yml" --env-file "$ENV_FILE" exec -T nextcloud php occ status &>/dev/null; then
-      info "Nextcloud服务已就绪"
-      return 0
-    fi
-    sleep 5
-    attempt=$((attempt + 1))
-  done
-  error "Nextcloud启动超时，请检查容器日志: $DOCKER_COMPOSE_CMD -p nextcloud logs nextcloud"
-}
+# ---------------------- 主部署流程 ----------------------
 
-# 配置Nextcloud集成
-configure_nextcloud() {
-  info "配置Nextcloud插件..."
-  source "$ENV_FILE"
-  wait_for_nextcloud
+echo "========================================"
+echo "开始部署 Nextcloud 服务..."
+echo "========================================"
 
-  local occ_cmd="$DOCKER_COMPOSE_CMD -p nextcloud -f $CONFIG_DIR/docker-compose.yml --env-file $ENV_FILE exec -T nextcloud php occ"
+# 部署服务，使用 --quiet-pull 减少输出
+# 使用 --wait 确保所有服务就绪
+dc -p nextcloud -f "$CONFIG_DIR/docker-compose.yml" up -d --wait --quiet-pull
+if [ $? -ne 0 ]; then
+  echo "   警告：部分服务未就绪，但脚本将继续执行..."
+fi
 
-  $occ_cmd app:install richdocuments >/dev/null 2>&1 || error "Richdocuments插件安装失败"
-  $occ_cmd app:enable richdocuments >/dev/null 2>&1 || error "Richdocuments插件启用失败"
-  $occ_cmd config:app:set richdocuments wopi_url --value="collabora:9980" >/dev/null 2>&1
-  $occ_cmd config:app:set richdocuments disable_certificate_verification --value="true" >/dev/null 2>&1
-  $occ_cmd config:app:set richdocuments wopi_allowlist --value="172.19.0.0/16" >/dev/null 2>&1
+echo -e "\n配置 Nextcloud..."
+if config_nextcloud; then
+  echo "✅ Nextcloud 配置完成！"
+else
+  echo "⚠️ 注意：部分配置可能失败，请检查日志"
+fi
 
-  $occ_cmd config:system:set allow_local_remote_servers --type boolean --value true >/dev/null 2>&1
-  $occ_cmd config:system:set maintenance_window_start --type integer --value 2 >/dev/null 2>&1
-  $occ_cmd config:system:set maintenance_window_end --type integer --value 4 >/dev/null 2>&1
-
-  info "执行系统维护..."
-  $occ_cmd maintenance:repair --include-expensive >/dev/null 2>&1 || warning "部分维护操作执行失败"
-}
-
-# 数据备份功能（适配数据卷）
-backup_data() {
-  [ ! -f "$ENV_FILE" ] && error "环境配置文件不存在"
-  source "$ENV_FILE"
-
-  mkdir -p "$BACKUP_DIR" || error "备份目录创建失败: $BACKUP_DIR"
-  [ ! -w "$BACKUP_DIR" ] && error "备份目录不可写: $BACKUP_DIR"
-
-  local timestamp="$(date +%Y%m%d_%H%M%S)"
-  local backup_file="$BACKUP_DIR/nextcloud_backup_$timestamp.tar.gz"
-  local temp_dir="$PROJECT_ROOT/temp_backup"
-  mkdir -p "$temp_dir"
-
-  info "开始备份数据到 $backup_file"
-
-  # 备份数据库
-  if ! $DOCKER_COMPOSE_CMD -p nextcloud -f "$CONFIG_DIR/docker-compose.yml" --env-file "$ENV_FILE" exec -T -e MYSQL_PWD="${MYSQL_ROOT_PASSWORD}" \
-     mariadb mysqldump -u root nextcloud > "$temp_dir/nextcloud_db.sql"; then
-    rm -rf "$temp_dir"
-    error "数据库备份失败"
-  fi
-
-  # 备份Nextcloud数据（从数据卷复制）
-  if ! $DOCKER_COMPOSE_CMD -p nextcloud -f "$CONFIG_DIR/docker-compose.yml" --env-file "$ENV_FILE" cp nextcloud:/var/www/html "$temp_dir/nextcloud_data"; then
-    rm -rf "$temp_dir"
-    error "Nextcloud数据备份失败"
-  fi
-
-  # 备份配置文件
-  cp -r "$CONFIG_DIR" "$temp_dir/"
-  cp "$ENV_FILE" "$temp_dir/"
-
-  # 打包备份
-  if ! tar -czf "$backup_file" -C "$temp_dir" .; then
-    rm -rf "$temp_dir"
-    error "数据打包失败"
-  fi
-
-  # 清理临时文件
-  rm -rf "$temp_dir" || warning "临时备份目录清理失败"
-
-  # 删除7天前的旧备份
-  find "$BACKUP_DIR" -name "nextcloud_backup_*.tar.gz" -mtime +7 -delete || warning "旧备份清理失败"
-  info "备份完成: $backup_file"
-}
-
-# 服务控制函数
-start() {
-  info "启动服务..."
-  $DOCKER_COMPOSE_CMD -p nextcloud -f "$CONFIG_DIR/docker-compose.yml" --env-file "$ENV_FILE" up -d --wait --wait-timeout 600
-  info "服务启动中，正在进行初始化配置..."
-  configure_nextcloud
-  info "部署完成！访问地址: https://$SERVER_IP:$HTTPS_PORT"
-}
-
-stop() {
-  info "停止服务..."
-  $DOCKER_COMPOSE_CMD -p nextcloud -f "$CONFIG_DIR/docker-compose.yml" --env-file "$ENV_FILE" down
-}
-
-restart() {
-  stop
-  start
-}
-
-# 主流程
-main() {
-  check_deps
-  check_ports
-  init_dirs
-  gen_env
-  gen_configs
-  start
-}
-
-main
+echo -e "\n========================================"
+echo "🎉 部署完成！"
+echo "========================================"
+echo "访问地址: https://$SERVER_IP:$HTTPS_PORT"
+echo "管理员账号: $ADMIN_USER"
+echo "管理员密码: $ADMIN_PASSWORD"
+echo ""
+echo "📋 后续建议："
+echo "1. 首次访问需要接受自签名证书"
+echo "2. 登录后建议修改默认密码"
+echo "3. 定期备份数据目录和数据库"
+echo "4. 关注 Nextcloud 官方安全更新"
+echo "========================================"
